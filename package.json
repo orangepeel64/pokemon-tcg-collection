@@ -1,0 +1,29 @@
+{
+  "name": "pokemon-tcg-collection",
+  "version": "1.0.0",
+  "description": "Beautiful Pokemon TCG collection with 3D perspective cards",
+  "main": "server.js",
+  "scripts": {
+    "server": "node server.js",
+    "dev": "concurrently \"npm run server\" \"npm:start --prefix client\"",
+    "build": "npm run build --prefix client"
+  },
+  "keywords": [
+    "pokemon",
+    "tcg",
+    "cards",
+    "collection"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "compression": "^1.8.1",
+    "cors": "^2.8.6",
+    "express": "^4.22.2",
+    "sqlite3": "^5.1.7",
+    "wtc-perspective-card": "^2.7.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
