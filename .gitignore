@@ -4,9 +4,6 @@ node_modules/
 # SQLite database (auto-generated, contains user data)
 pokemon.db
 
-# Pokemon TCG source data (separate repo, 100MB+ of JSON)
-data-source/
-
 # Environment variables
 .env
 .env.local
@@ -27,3 +24,4 @@ Thumbs.db
 *.swp
 *.swo
 *~
+data-source/

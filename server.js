@@ -3,7 +3,6 @@ const cors = require('cors');
 const compression = require('compression');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 
@@ -15,7 +14,10 @@ app.use(compression());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'client/public')));
 
-const db = new sqlite3.Database('./pokemon.db');
+const dbPath = process.env.NODE_ENV === 'production'
+  ? '/data/pokemon.db'
+  : './pokemon.db';
+const db = new sqlite3.Database(dbPath);
 
 // ──────────────── Database Setup ────────────────
 db.serialize(() => {
@@ -108,70 +110,6 @@ db.serialize(() => {
 });
 
 // ──────────────── Data Import ────────────────
-function importData() {
-  const cardsDir = path.join(__dirname, 'data-source/cards/en');
-  const setsFile = path.join(__dirname, 'data-source/sets/en.json');
-
-  const setsData = JSON.parse(fs.readFileSync(setsFile, 'utf8'));
-
-  const setStmt = db.prepare(`INSERT OR REPLACE INTO sets (id, name, series, printedTotal, total, releaseDate, symbolUrl, logoUrl) VALUES (?,?,?,?,?,?,?,?)`);
-  setsData.forEach(set => {
-    setStmt.run(
-      set.id, set.name, set.series, set.printedTotal, set.total,
-      set.releaseDate, set.images?.symbol, set.images?.logo
-    );
-  });
-  setStmt.finalize();
-  console.log(`Imported ${setsData.length} sets`);
-
-  const cardInsert = `INSERT OR REPLACE INTO cards (id, name, supertype, subtypes, hp, types, evolvesFrom, level, rarity, artist, flavorText, nationalPokedexNumbers, number, setId, smallImageUrl, largeImageUrl) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
-  const cardStmt = db.prepare(cardInsert);
-  const attackStmt = db.prepare(`INSERT INTO attacks (cardId, name, cost, damage, text) VALUES (?,?,?,?,?)`);
-  const abilityStmt = db.prepare(`INSERT INTO abilities (cardId, name, text, type) VALUES (?,?,?,?)`);
-
-  let cardCount = 0;
-  fs.readdirSync(cardsDir).forEach(file => {
-    if (file.endsWith('.json')) {
-      const cards = JSON.parse(fs.readFileSync(path.join(cardsDir, file), 'utf8'));
-      cards.forEach(card => {
-        const setId = card.id.split('-')[0];
-        cardStmt.run(
-          card.id,
-          card.name,
-          card.supertype,
-          JSON.stringify(card.subtypes || []),
-          card.hp ? parseInt(card.hp) : null,
-          JSON.stringify(card.types || []),
-          card.evolvesFrom,
-          card.level,
-          card.rarity,
-          card.artist,
-          card.flavorText,
-          JSON.stringify(card.nationalPokedexNumbers || []),
-          card.number,
-          setId,
-          card.images?.small,
-          card.images?.large
-        );
-
-        (card.attacks || []).forEach(attack => {
-          attackStmt.run(card.id, attack.name, JSON.stringify(attack.cost), attack.damage, attack.text);
-        });
-
-        (card.abilities || []).forEach(ability => {
-          abilityStmt.run(card.id, ability.name, ability.text, ability.type);
-        });
-        cardCount++;
-      });
-    }
-  });
-
-  cardStmt.finalize();
-  attackStmt.finalize();
-  abilityStmt.finalize();
-  console.log(`Imported ${cardCount} cards`);
-}
-
 // ──────────────── Auth Middleware ────────────────
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -707,10 +645,16 @@ app.post('/api/prices/batch', (req, res) => {
 });
 
 // ──────────────── Data Import Trigger ────────────────
+// Auto-seed on first boot if DB is empty
 db.get("SELECT COUNT(*) as count FROM cards", (err, row) => {
   if (err || row.count === 0) {
-    console.log('Importing data...');
-    importData();
+    console.log('Database empty, seeding from Pokemon TCG API...');
+    const { execSync } = require('child_process');
+    try {
+      execSync('node seed.js', { stdio: 'inherit', timeout: 600000 });
+    } catch (e) {
+      console.error('Seed failed:', e.message);
+    }
   } else {
     console.log(`Database already has ${row.count} cards`);
   }
