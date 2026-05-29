@@ -1,141 +1,286 @@
-#!/usr/bin/env node
 /**
- * Seed script: imports Pokemon TCG data from the public API
- * Run: node seed.js
- * This replaces the old data-source/ JSON import for deployment
+ * Seed script — full TCGdex import for all languages.
+ * Drops existing cards/sets/series and reimports from scratch.
+ * Usage: node seed.js
+ * Environment: LANGUAGES=en,ja (comma-separated)
  */
 const https = require('https');
-const http = require('http');
 const sqlite3 = require('sqlite3').verbose();
-const fs = require('fs');
-const path = require('path');
 
-const DB_PATH = process.env.DB_PATH || './pokemon.db';
-const API_BASE = 'https://api.pokemontcg.io/v2';
-const API_KEY = process.env.POKEMONTCG_API_KEY || ''; // optional, free tier works without
+const LANGS = (process.env.LANGUAGES || 'en,ja').split(',').map(l => l.trim());
+const API = 'https://api.tcgdex.net/v2';
+const DB = process.env.NODE_ENV === 'production' ? '/data/pokemon.db' : './pokemon.db';
 
-const db = new sqlite3.Database(DB_PATH);
-
-function fetchJSON(url) {
+function fetchJSON(url, retries = 3) {
   return new Promise((resolve, reject) => {
-    const mod = url.startsWith('https') ? https : http;
-    const headers = { 'Content-Type': 'application/json' };
-    if (API_KEY) headers['X-Api-Key'] = API_KEY;
-    mod.get(url, { headers }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'poke-tcg/3.0' },
+      family: 4,
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { resolve(null); }
+        if (res.statusCode !== 200) return resolve(null);
+        try { resolve(JSON.parse(d)); } catch { resolve(null); }
       });
-    }).on('error', reject);
+    });
+    req.on('error', e => {
+      if (retries > 1) {
+        setTimeout(() => fetchJSON(url, retries - 1).then(resolve).catch(reject), 1000);
+      } else reject(e);
+    });
+    req.setTimeout(15000, () => { req.destroy(); 
+      if (retries > 1) {
+        setTimeout(() => fetchJSON(url, retries - 1).then(resolve).catch(reject), 1000);
+      } else reject(new Error('timeout'));
+    });
   });
 }
 
-async function seed() {
-  console.log('Seeding database from Pokemon TCG API...');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const db = new sqlite3.Database(DB);
 
-  db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS cards (
-      id TEXT PRIMARY KEY, name TEXT, supertype TEXT, subtypes TEXT,
-      hp INTEGER, types TEXT, evolvesFrom TEXT, level TEXT, rarity TEXT,
-      artist TEXT, flavorText TEXT, nationalPokedexNumbers TEXT,
-      number TEXT, setId TEXT, smallImageUrl TEXT, largeImageUrl TEXT
-    )`);
-    db.run(`CREATE TABLE IF NOT EXISTS sets (
-      id TEXT PRIMARY KEY, name TEXT, series TEXT, printedTotal INTEGER,
-      total INTEGER, releaseDate TEXT, symbolUrl TEXT, logoUrl TEXT
-    )`);
-    db.run(`CREATE TABLE IF NOT EXISTS collection (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, cardId TEXT, quantity INTEGER DEFAULT 1,
-      condition TEXT DEFAULT 'Near Mint', dateAdded TEXT DEFAULT CURRENT_TIMESTAMP,
-      user_id INTEGER DEFAULT 1, FOREIGN KEY (cardId) REFERENCES cards(id)
-    )`);
-    db.run(`CREATE TABLE IF NOT EXISTS attacks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, cardId TEXT, name TEXT,
-      cost TEXT, damage TEXT, text TEXT, FOREIGN KEY (cardId) REFERENCES cards(id)
-    )`);
-    db.run(`CREATE TABLE IF NOT EXISTS abilities (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, cardId TEXT, name TEXT,
-      text TEXT, type TEXT, FOREIGN KEY (cardId) REFERENCES cards(id)
-    )`);
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )`);
-    db.run(`CREATE TABLE IF NOT EXISTS sessions (
-      token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_id) REFERENCES users(id)
-    )`);
-    db.run(`CREATE TABLE IF NOT EXISTS friends (
-      user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (user_id, friend_id),
-      FOREIGN KEY (user_id) REFERENCES users(id),
-      FOREIGN KEY (friend_id) REFERENCES users(id)
-    )`);
+function dbRun(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
   });
+}
 
-  // Check if already seeded
-  const count = await new Promise((resolve) => {
-    db.get('SELECT COUNT(*) as c FROM cards', (err, row) => resolve(row ? row.c : 0));
-  });
-  if (count > 0) {
-    console.log(`Database already has ${count} cards, skipping seed.`);
-    db.close();
-    return;
-  }
+async function main() {
+  console.log(`\n🔄 TCGdex Seed — Languages: ${LANGS.join(', ')}\n`);
 
-  // Import sets first
-  console.log('Fetching sets...');
-  const setsData = await fetchJSON(`${API_BASE}/sets?pageSize=250`);
-  if (setsData && setsData.data) {
-    const setStmt = db.prepare('INSERT OR REPLACE INTO sets (id,name,series,printedTotal,total,releaseDate,symbolUrl,logoUrl) VALUES (?,?,?,?,?,?,?,?)');
-    for (const s of setsData.data) {
-      setStmt.run(s.id, s.name, s.series, s.printedTotal, s.total, s.releaseDate, s.images?.symbol, s.images?.logo);
+  // ── Schema (drop + recreate for clean import) ──
+  await dbRun(`DROP TABLE IF EXISTS card_resistances`);
+  await dbRun(`DROP TABLE IF EXISTS card_weaknesses`);
+  await dbRun(`DROP TABLE IF EXISTS card_abilities`);
+  await dbRun(`DROP TABLE IF EXISTS card_attacks`);
+  await dbRun(`DROP TABLE IF EXISTS collection`);
+  await dbRun(`DROP TABLE IF EXISTS cards`);
+  await dbRun(`DROP TABLE IF EXISTS sets`);
+  await dbRun(`DROP TABLE IF EXISTS series`);
+  await dbRun(`DROP TABLE IF EXISTS sessions`);
+  await dbRun(`DROP TABLE IF EXISTS users`);
+
+  await dbRun(`CREATE TABLE series (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, language TEXT NOT NULL
+  )`);
+  await dbRun(`CREATE TABLE sets (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, series_id TEXT,
+    language TEXT NOT NULL, logo TEXT, symbol TEXT,
+    card_count INTEGER DEFAULT 0, release_date TEXT
+  )`);
+  await dbRun(`CREATE TABLE cards (
+    id TEXT NOT NULL, local_id TEXT NOT NULL, name TEXT NOT NULL,
+    set_id TEXT NOT NULL, language TEXT NOT NULL,
+    category TEXT, illustrator TEXT, rarity TEXT,
+    image_url TEXT, image_hi TEXT, hp INTEGER, types TEXT,
+    stage TEXT, evolve_from TEXT, suffix TEXT, retreat TEXT,
+    description TEXT, effect TEXT, level TEXT,
+    regulation TEXT, legal_std INTEGER DEFAULT 0, legal_exp INTEGER DEFAULT 0,
+    variants TEXT, attacks TEXT, abilities TEXT, weaknesses TEXT, resistances TEXT,
+    pricing TEXT, PRIMARY KEY (id, language)
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS card_attacks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL,
+    language TEXT NOT NULL, name TEXT, cost TEXT, damage TEXT, effect TEXT
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS card_abilities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL,
+    language TEXT NOT NULL, name TEXT, effect TEXT, type TEXT
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS card_weaknesses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL,
+    language TEXT NOT NULL, type TEXT, value TEXT
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS card_resistances (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT NOT NULL,
+    language TEXT NOT NULL, type TEXT, value TEXT
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+    is_admin INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS collection (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, card_id TEXT,
+    user_id INTEGER DEFAULT 1, quantity INTEGER DEFAULT 1,
+    condition TEXT DEFAULT 'Near Mint', language TEXT DEFAULT 'en',
+    date_added TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS friends (
+    user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, friend_id)
+  )`);
+
+  // Create indexes for fast filtering
+  await dbRun(`CREATE INDEX idx_cards_set ON cards(set_id)`);
+  await dbRun(`CREATE INDEX idx_cards_lang ON cards(language)`);
+  await dbRun(`CREATE INDEX idx_cards_name ON cards(name)`);
+  await dbRun(`CREATE INDEX idx_cards_rarity ON cards(rarity)`);
+  await dbRun(`CREATE INDEX idx_cards_category ON cards(category)`);
+  await dbRun(`CREATE INDEX idx_cards_type ON cards(types)`);
+  await dbRun(`CREATE INDEX idx_cards_stage ON cards(stage)`);
+
+  let globalCardCount = 0;
+  let globalSetCount = 0;
+
+  for (const lang of LANGS) {
+    console.log(`\n═══ ${lang.toUpperCase()} ═══`);
+
+    // ── Series ──
+    const seriesList = await fetchJSON(`${API}/${lang}/series`);
+    if (seriesList && Array.isArray(seriesList)) {
+      const stmt = db.prepare(`INSERT OR REPLACE INTO series (id, name, language) VALUES (?, ?, ?)`);
+      for (const s of seriesList) {
+        const detail = await fetchJSON(`${API}/${lang}/series/${s.id}`);
+        stmt.run(s.id, detail?.name || s.name, lang);
+        await sleep(15);
+      }
+      stmt.finalize();
+      console.log(`  Series: ${seriesList.length}`);
+    }
+
+    // ── Sets ──
+    const setsList = await fetchJSON(`${API}/${lang}/sets`);
+    if (!setsList || !Array.isArray(setsList)) { console.log('  No sets found'); continue; }
+
+    const setStmt = db.prepare(
+      `INSERT OR REPLACE INTO sets (id, name, series_id, language, logo, symbol, card_count, release_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    for (let i = 0; i < setsList.length; i++) {
+      const s = setsList[i];
+      let detail = null;
+      try {
+        detail = await fetchJSON(`${API}/${lang}/sets/${s.id}`);
+        await sleep(20);
+      } catch {}
+
+      const cardCount = detail?.cardCount
+        ? (detail.cardCount.total || 0)
+        : (s.cardCount?.total || 0);
+
+      setStmt.run(
+        s.id,
+        detail?.name || s.name,
+        detail?.serie?.id || s.serie?.id || null,
+        lang,
+        detail?.logo || s.logo || null,
+        detail?.symbol || s.symbol || null,
+        cardCount,
+        detail?.releaseDate || s.releaseDate || null
+      );
+
+      process.stdout.write(`\r  Sets: ${i + 1}/${setsList.length}`);
     }
     setStmt.finalize();
-    console.log(`Imported ${setsData.data.length} sets`);
-  }
+    console.log(`\n  ✓ ${setsList.length} sets`);
+    globalSetCount += setsList.length;
 
-  // Import cards (paginated)
-  let page = 1;
-  let totalImported = 0;
-  const cardStmt = db.prepare('INSERT OR REPLACE INTO cards (id,name,supertype,subtypes,hp,types,evolvesFrom,level,rarity,artist,flavorText,nationalPokedexNumbers,number,setId,smallImageUrl,largeImageUrl) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
-  const attackStmt = db.prepare('INSERT INTO attacks (cardId,name,cost,damage,text) VALUES (?,?,?,?,?)');
-  const abilityStmt = db.prepare('INSERT INTO abilities (cardId,name,text,type) VALUES (?,?,?,?)');
+    // ── Cards — from set details (fast, one API call per set = full card list) ──
+    let cardStmt = db.prepare(
+      `INSERT OR REPLACE INTO cards
+       (id, local_id, name, set_id, language, category, illustrator, rarity,
+        image_url, image_hi, hp, types, stage, evolve_from, suffix, retreat,
+        description, effect, level, regulation, legal_std, legal_exp, variants,
+        attacks, abilities, weaknesses, resistances, pricing)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    );
 
-  while (true) {
-    const data = await fetchJSON(`${API_BASE}/cards?page=${page}&pageSize=250`);
-    if (!data || !data.data || data.data.length === 0) break;
+    let langCardCount = 0;
+    let skipped = 0;
 
-    for (const c of data.data) {
-      const setId = c.id.split('-')[0];
-      cardStmt.run(c.id, c.name, c.supertype, JSON.stringify(c.subtypes||[]),
-        c.hp ? parseInt(c.hp) : null, JSON.stringify(c.types||[]),
-        c.evolvesFrom, c.level, c.rarity, c.artist, c.flavorText,
-        JSON.stringify(c.nationalPokedexNumbers||[]), c.number, setId,
-        c.images?.small, c.images?.large);
-      (c.attacks||[]).forEach(a => attackStmt.run(c.id, a.name, JSON.stringify(a.cost), a.damage, a.text));
-      (c.abilities||[]).forEach(a => abilityStmt.run(c.id, a.name, a.text, a.type));
-      totalImported++;
+    for (let i = 0; i < setsList.length; i++) {
+      const s = setsList[i];
+      let detail = null;
+      try {
+        detail = await fetchJSON(`${API}/${lang}/sets/${s.id}`);
+        await sleep(25);
+      } catch { continue; }
+
+      const cards = detail?.cards || [];
+      if (!cards.length) { skipped++; continue; }
+
+      for (const c of cards) {
+        const cardDetail = {
+          category: c.category || null,
+          illustrator: c.illustrator || null,
+          rarity: c.rarity || null,
+          hp: c.hp || null,
+          types: c.types ? JSON.stringify(c.types) : null,
+          stage: c.stage || null,
+          evolveFrom: c.evolveFrom || null,
+          suffix: c.suffix || null,
+          retreat: c.retreat != null ? c.retreat : null,
+          description: c.description || null,
+          effect: c.effect || null,
+          level: c.level != null ? String(c.level) : null,
+          regulationMark: c.regulationMark || null,
+          legal: c.legal || null,
+          variants: c.variants ? JSON.stringify(c.variants) : null,
+          attacks: c.attacks ? JSON.stringify(c.attacks) : null,
+          abilities: c.abilities ? JSON.stringify(c.abilities) : null,
+          weaknesses: c.weaknesses ? JSON.stringify(c.weaknesses) : null,
+          resistances: c.resistances ? JSON.stringify(c.resistances) : null,
+          pricing: c.pricing ? JSON.stringify(c.pricing) : null,
+        };
+
+        // Build image URLs
+        const seriePath = detail?.serie?.id || s.id.replace(/[0-9.]/g, '') || 'unknown';
+        const imgLow = c.image || `https://assets.tcgdex.net/${lang}/${seriePath}/${s.id}/${c.localId || c.id.split('-')[1] || '001'}/low.png`;
+        const imgHigh = imgLow.replace('/low.png', '/high.png');
+
+        cardStmt.run(
+          c.id,
+          c.localId || c.id.split('-')[1] || '001',
+          c.name,
+          s.id,
+          lang,
+          cardDetail.category,
+          cardDetail.illustrator,
+          cardDetail.rarity,
+          imgLow, imgHigh,
+          cardDetail.hp,
+          cardDetail.types,
+          cardDetail.stage,
+          cardDetail.evolveFrom,
+          cardDetail.suffix,
+          cardDetail.retreat,
+          cardDetail.description,
+          cardDetail.effect,
+          cardDetail.level,
+          cardDetail.regulationMark,
+          cardDetail.legal?.standard ? 1 : 0,
+          cardDetail.legal?.expanded ? 1 : 0,
+          cardDetail.variants,
+          cardDetail.attacks,
+          cardDetail.abilities,
+          cardDetail.weaknesses,
+          cardDetail.resistances,
+          cardDetail.pricing
+        );
+        langCardCount++;
+      }
+
+      process.stdout.write(`\r  Cards: ${langCardCount} (set ${i + 1}/${setsList.length})`);
     }
 
-    console.log(`Page ${page}: ${totalImported} cards imported...`);
-    page++;
-
-    // Rate limit: be nice to the API
-    await new Promise(r => setTimeout(r, 200));
-
-    // Safety: stop after reasonable limit for free tier
-    if (totalImported >= 25000) break;
+    cardStmt.finalize();
+    console.log(`\n  ✓ ${langCardCount} cards (${skipped} empty sets skipped)`);
+    globalCardCount += langCardCount;
   }
 
-  cardStmt.finalize();
-  attackStmt.finalize();
-  abilityStmt.finalize();
+  console.log(`\n✅ Done! ${globalSetCount} sets, ${globalCardCount} cards\n`);
   db.close();
-  console.log(`Done! Imported ${totalImported} cards.`);
 }
 
-seed().catch(e => { console.error(e); process.exit(1); });
+main().catch(e => { console.error('Fatal:', e); process.exit(1); });
